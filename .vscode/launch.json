@@ -1,0 +1,18 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run Program",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}\\bin\\Debug\\project.exe",
+      "args": [],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}",
+      "externalConsole": true,
+      "preLaunchTask": "Build Project (g++)",
+      "MIMode": "gdb",
+      "miDebuggerPath": "C:\\msys64\\mingw64\\bin\\gdb.exe"
+    }
+  ]
+}
