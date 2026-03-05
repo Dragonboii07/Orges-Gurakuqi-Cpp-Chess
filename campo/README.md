@@ -46,14 +46,6 @@ A C++ application for managing student and teacher information with dynamic grad
 - **Build Tool**: g++ (MinGW-w64)
 - **C++ Standard**: C++17 or later
 
-## Build Instructions
-
-### Using VS Code (Recommended)
-
-1. Open the project folder in VS Code
-2. Press `Ctrl+Shift+B` to build
-3. Press `F5` to run with debugger
-4. Or use Task → Run Task → "Build Project (g++)"
 
 ### Using Command Line
 
