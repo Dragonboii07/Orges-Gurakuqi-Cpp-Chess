@@ -1,28 +1,125 @@
 #include "Board.h"
+#include <algorithm>
+#include <cctype>
+#include <cstdlib>
 #include <iostream>
+#include <sstream>
+
+static const char* START_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+
+static inline bool onBoard(int file, int rank) {
+    return file >= 0 && file < 8 && rank >= 0 && rank < 8;
+}
+
+// (file, rank) steps; first 4 are orthogonal (rook), last 4 diagonal (bishop)
+static const int kingDeltas[8][2] = {
+    {1,0}, {-1,0}, {0,1}, {0,-1}, {1,1}, {1,-1}, {-1,1}, {-1,-1}
+};
+static const int knightDeltas[8][2] = {
+    {1,2}, {2,1}, {2,-1}, {1,-2}, {-1,-2}, {-2,-1}, {-2,1}, {-1,2}
+};
+
+// castlingRights &= castleMask[from] & castleMask[to]: moving or capturing on a
+// king/rook home square removes the matching rights
+static unsigned char castleMaskFor(int sq) {
+    switch (sq) {
+        case 0:  return 0b1101; // a1 rook: white Q
+        case 4:  return 0b1100; // e1 king: white KQ
+        case 7:  return 0b1110; // h1 rook: white K
+        case 56: return 0b0111; // a8 rook: black q
+        case 60: return 0b0011; // e8 king: black kq
+        case 63: return 0b1011; // h8 rook: black k
+        default: return 0b1111;
+    }
+}
+
+// Zobrist keys, generated once from a fixed seed
+struct ZobristKeys {
+    uint64_t piece[13][64];
+    uint64_t blackToMove;
+    uint64_t castling[16];
+    uint64_t epFile[8];
+    ZobristKeys() {
+        uint64_t s = 0x9E3779B97F4A7C15ULL;
+        auto next = [&s]() {
+            // splitmix64
+            uint64_t z = (s += 0x9E3779B97F4A7C15ULL);
+            z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+            z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+            return z ^ (z >> 31);
+        };
+        for (auto& row : piece) for (auto& k : row) k = next();
+        blackToMove = next();
+        for (auto& k : castling) k = next();
+        for (auto& k : epFile) k = next();
+    }
+};
+static const ZobristKeys zobrist;
 
 Board::Board() {
     reset();
 }
 
 void Board::reset() {
-    whiteToMove = true;
-    castlingRights = 0b1111; // KQkq available
-    enPassant = -1;
+    setFen(START_FEN);
+}
+
+bool Board::setFen(const std::string& fenStr) {
+    std::istringstream iss(fenStr);
+    std::string placement, side, castling, ep;
+    if (!(iss >> placement >> side >> castling >> ep)) return false;
+    int half = 0, full = 1;
+    iss >> half >> full;
+
+    std::array<Piece, 64> sq;
+    sq.fill(EMPTY);
+    int rank = 7, file = 0;
+    for (char c : placement) {
+        if (c == '/') {
+            if (file != 8) return false;
+            --rank;
+            file = 0;
+        } else if (c >= '1' && c <= '8') {
+            file += c - '0';
+        } else {
+            Piece p = pieceFromChar(c);
+            if (p == EMPTY || !onBoard(file, rank)) return false;
+            sq[rank*8 + file++] = p;
+        }
+        if (file > 8 || rank < 0) return false;
+    }
+    if (rank != 0 || file != 8) return false;
+    if (std::count(sq.begin(), sq.end(), WK) != 1 || std::count(sq.begin(), sq.end(), BK) != 1) return false;
+    if (side != "w" && side != "b") return false;
+
+    unsigned char cr = 0;
+    if (castling != "-") {
+        for (char c : castling) {
+            switch (c) {
+                case 'K': cr |= 1; break;
+                case 'Q': cr |= 2; break;
+                case 'k': cr |= 4; break;
+                case 'q': cr |= 8; break;
+                default: return false;
+            }
+        }
+    }
+    int epSq = -1;
+    if (ep != "-") {
+        if (ep.size() != 2 || ep[0] < 'a' || ep[0] > 'h' || ep[1] < '1' || ep[1] > '8') return false;
+        epSq = (ep[0] - 'a') + (ep[1] - '1') * 8;
+    }
+
+    squares = sq;
+    whiteToMove = (side == "w");
+    castlingRights = cr;
+    enPassant = epSq;
+    halfmoveClock = half;
+    fullmoveNumber = full;
+    undoStack.clear();
     history.clear();
-    // initial position
-    const Piece init[64] = {
-        WR, WN, WB, WQ, WK, WB, WN, WR,
-        WP, WP, WP, WP, WP, WP, WP, WP,
-        EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY,
-        EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY,
-        EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY,
-        EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY,
-        BP, BP, BP, BP, BP, BP, BP, BP,
-        BR, BN, BB, BQ, BK, BB, BN, BR
-    };
-    for (int i = 0; i < 64; ++i) squares[i] = init[i];
-    history.push_back(fen());
+    history.push_back(hash());
+    return true;
 }
 
 char Board::pieceToChar(Piece p) {
@@ -73,11 +170,9 @@ void Board::print() const {
     std::cout << "  a b c d e f g h\n";
 }
 
-// simple move generation with special rules
-static const int knightOffsets[8] = {17, 15, 10, 6, -17, -15, -10, -6};
-static const int kingOffsets[8] = {1, -1, 8, -8, 9, 7, -9, -7};
-
-// piece-square tables (white perspective); we'll mirror for black by flipping index
+// piece-square tables, written as you'd see the board from white's side:
+// the first row is rank 8, the last row is rank 1. Index with (sq ^ 56) for
+// white and sq for black.
 static const int pawnTable[64] = {
       0,   0,   0,   0,   0,   0,   0,   0,
      50,  50,  50,  50,  50,  50,  50,  50,
@@ -138,138 +233,74 @@ static const int kingTable[64] = {
      20, 20,  0,  0,  0,  0, 20, 20,
      20, 30, 10,  0,  0, 10, 30, 20
 };
+
+static void addPawnMove(std::vector<Move>& moves, int from, int to, bool promotes) {
+    if (promotes) {
+        moves.emplace_back(from, to, 'q');
+        moves.emplace_back(from, to, 'r');
+        moves.emplace_back(from, to, 'b');
+        moves.emplace_back(from, to, 'n');
+    } else {
+        moves.emplace_back(from, to);
+    }
+}
+
 std::vector<Move> Board::generateMoves() const {
     std::vector<Move> moves;
+    moves.reserve(64);
     bool white = whiteToMove;
     for (int sq = 0; sq < 64; ++sq) {
         Piece p = squares[sq];
-        if (p == EMPTY) continue;
-        bool isWhite = (p <= WK && p >= WP);
-        if (isWhite != white) continue;
-        int dir = isWhite ? 1 : -1;
+        if (p == EMPTY || isWhitePiece(p) != white) continue;
+        int file = sq % 8, rank = sq / 8;
+        auto isEnemy = [&](Piece q) { return q != EMPTY && isWhitePiece(q) != white; };
+
         switch (p) {
-            case WP:
-            case BP: {
-                int forward = sq + dir*8;
-                if (forward >=0 && forward < 64 && squares[forward]==EMPTY) {
-                    // promotion
-                    int rank = forward/8;
-                    if (rank==0 || rank==7) {
-                        moves.emplace_back(sq, forward, 'q');
-                        moves.emplace_back(sq, forward, 'r');
-                        moves.emplace_back(sq, forward, 'b');
-                        moves.emplace_back(sq, forward, 'n');
-                    } else {
-                        moves.emplace_back(sq, forward);
-                    }
-                    // double move
-                    int startRank = isWhite ? 1 : 6;
-                    if (sq/8 == startRank) {
-                        int dbl = sq + dir*16;
-                        if (squares[dbl] == EMPTY) moves.emplace_back(sq, dbl);
-                    }
+            case WP: case BP: {
+                int dir = white ? 1 : -1;
+                int promoRank = white ? 7 : 0;
+                int startRank = white ? 1 : 6;
+                int fr = rank + dir;
+                if (!onBoard(file, fr)) break;
+                int forward = fr*8 + file;
+                if (squares[forward] == EMPTY) {
+                    addPawnMove(moves, sq, forward, fr == promoRank);
+                    int dbl = forward + dir*8;
+                    if (rank == startRank && squares[dbl] == EMPTY) moves.emplace_back(sq, dbl);
                 }
-                // captures
-                int caps[2] = {sq + dir*8 + 1, sq + dir*8 - 1};
-                for (int i =0;i<2;++i) {
-                    int t = caps[i];
-                    if (t>=0 && t<64) {
-                        Piece q = squares[t];
-                        if (q!=EMPTY) {
-                            bool qWhite = (q<=WK && q>=WP);
-                            if (qWhite!=isWhite) {
-                                int rank = t/8;
-                                if (rank==0||rank==7) {
-                                    moves.emplace_back(sq,t,'q');
-                                    moves.emplace_back(sq,t,'r');
-                                    moves.emplace_back(sq,t,'b');
-                                    moves.emplace_back(sq,t,'n');
-                                } else {
-                                    moves.emplace_back(sq,t);
-                                }
-                            }
-                        }
-                    }
-                }
-                // en passant capture
-                if (enPassant >= 0) {
-                    int epRank = enPassant/8;
-                    int epFile = enPassant%8;
-                    int sqRank = sq/8;
-                    if ((sqRank + dir) == epRank && abs((sq%8) - epFile) == 1) {
-                        moves.emplace_back(sq, enPassant);
-                    }
+                for (int df : {-1, 1}) {
+                    if (!onBoard(file + df, fr)) continue;
+                    int t = fr*8 + file + df;
+                    if (isEnemy(squares[t])) addPawnMove(moves, sq, t, fr == promoRank);
+                    else if (t == enPassant) moves.emplace_back(sq, t);
                 }
                 break;
             }
             case WN: case BN: {
-                for (int k: knightOffsets) {
-                    int t = sq + k;
-                    if (t<0 || t>=64) continue;
-                    int df = (t%8) - (sq%8);
-                    int dr = (t/8) - (sq/8);
-                    if (abs(df)>2||abs(dr)>2) continue;
-                    Piece q = squares[t];
-                    if (q==EMPTY || ((q<=WK) != isWhite)) {
-                        moves.emplace_back(sq,t);
-                    }
+                for (auto& d : knightDeltas) {
+                    int f = file + d[0], r = rank + d[1];
+                    if (!onBoard(f, r)) continue;
+                    Piece q = squares[r*8 + f];
+                    if (q == EMPTY || isEnemy(q)) moves.emplace_back(sq, r*8 + f);
                 }
                 break;
             }
-            case WB: case BB: {
-                int directions[4] = {9,7,-9,-7};
-                for (int d: directions) {
-                    int t = sq;
-                    while (1) {
-                        t += d;
-                        if (t<0||t>=64) break;
-                        int df = (t%8) - ((t-d)%8);
-                        if (abs(df)>1) break; // wrap
-                        Piece q = squares[t];
-                        if (q==EMPTY) {
-                            moves.emplace_back(sq,t);
-                        } else {
-                            if ((q<=WK)!=isWhite) moves.emplace_back(sq,t);
-                            break;
-                        }
-                    }
-                }
-                break;
-            }
-            case WR: case BR: {
-                int directions[4] = {1,-1,8,-8};
-                for (int d: directions) {
-                    int t = sq;
-                    while (1) {
-                        t += d;
-                        if (t<0||t>=64) break;
-                        int df = (t%8) - ((t-d)%8);
-                        if (abs(d)==1 && abs(df)>1) break;
-                        Piece q = squares[t];
-                        if (q==EMPTY) {
-                            moves.emplace_back(sq,t);
-                        } else {
-                            if ((q<=WK)!=isWhite) moves.emplace_back(sq,t);
-                            break;
-                        }
-                    }
-                }
-                break;
-            }
+            case WB: case BB:
+            case WR: case BR:
             case WQ: case BQ: {
-                int directions[8] = {1,-1,8,-8,9,7,-9,-7};
-                for (int d: directions) {
-                    int t = sq;
-                    while (1) {
-                        t += d;
-                        if (t<0||t>=64) break;
-                        int df = (t%8) - ((t-d)%8);
-                        if (abs(d)==1 && abs(df)>1) break;
-                        Piece q = squares[t];
-                        if (q==EMPTY) {
-                            moves.emplace_back(sq,t);
+                int first = (p == WB || p == BB) ? 4 : 0;
+                int last  = (p == WR || p == BR) ? 4 : 8;
+                for (int i = first; i < last; ++i) {
+                    int f = file, r = rank;
+                    while (true) {
+                        f += kingDeltas[i][0];
+                        r += kingDeltas[i][1];
+                        if (!onBoard(f, r)) break;
+                        Piece q = squares[r*8 + f];
+                        if (q == EMPTY) {
+                            moves.emplace_back(sq, r*8 + f);
                         } else {
-                            if ((q<=WK)!=isWhite) moves.emplace_back(sq,t);
+                            if (isEnemy(q)) moves.emplace_back(sq, r*8 + f);
                             break;
                         }
                     }
@@ -277,40 +308,28 @@ std::vector<Move> Board::generateMoves() const {
                 break;
             }
             case WK: case BK: {
-                for (int k: kingOffsets) {
-                    int t = sq + k;
-                    if (t<0||t>=64) continue;
-                    int df = (t%8) - (sq%8);
-                    if (abs(df)>1) continue;
-                    Piece q = squares[t];
-                    if (q==EMPTY || ((q<=WK) != isWhite)) {
-                        moves.emplace_back(sq,t);
-                    }
+                for (auto& d : kingDeltas) {
+                    int f = file + d[0], r = rank + d[1];
+                    if (!onBoard(f, r)) continue;
+                    Piece q = squares[r*8 + f];
+                    if (q == EMPTY || isEnemy(q)) moves.emplace_back(sq, r*8 + f);
                 }
-                // castling (simplified: ignore checks)
-                if (isWhite && sq==4 && whiteToMove) {
-                    if (castlingRights & 1) { // K
-                        if (squares[5]==EMPTY && squares[6]==EMPTY) {
-                            moves.emplace_back(4,6); // king-side
-                        }
-                    }
-                    if (castlingRights & 2) { // Q
-                        if (squares[3]==EMPTY && squares[2]==EMPTY && squares[1]==EMPTY) {
-                            moves.emplace_back(4,2); // queen-side
-                        }
-                    }
+                // castling: king may not start in or pass through check; landing
+                // in check is rejected by the legality filter
+                int home = white ? 4 : 60;
+                if (sq != home) break;
+                unsigned char kRight = white ? 1 : 4, qRight = white ? 2 : 8;
+                Piece rook = white ? WR : BR;
+                bool enemy = !white;
+                if ((castlingRights & kRight) && squares[home+1] == EMPTY && squares[home+2] == EMPTY
+                    && squares[home+3] == rook
+                    && !isSquareAttacked(home, enemy) && !isSquareAttacked(home+1, enemy)) {
+                    moves.emplace_back(home, home+2);
                 }
-                if (!isWhite && sq==60 && !whiteToMove) {
-                    if (castlingRights & 4) { // k
-                        if (squares[61]==EMPTY && squares[62]==EMPTY) {
-                            moves.emplace_back(60,62);
-                        }
-                    }
-                    if (castlingRights & 8) { // q
-                        if (squares[59]==EMPTY && squares[58]==EMPTY && squares[57]==EMPTY) {
-                            moves.emplace_back(60,58);
-                        }
-                    }
+                if ((castlingRights & qRight) && squares[home-1] == EMPTY && squares[home-2] == EMPTY
+                    && squares[home-3] == EMPTY && squares[home-4] == rook
+                    && !isSquareAttacked(home, enemy) && !isSquareAttacked(home-1, enemy)) {
+                    moves.emplace_back(home, home-2);
                 }
                 break;
             }
@@ -320,139 +339,157 @@ std::vector<Move> Board::generateMoves() const {
     return moves;
 }
 
-bool Board::makeMove(const Move& m) {
-    Piece p = squares[m.from];
-    Piece dest = squares[m.to];
-    // save previous state for unmake
-    unsigned char prevCastling = castlingRights;
-    int prevEP = enPassant;
-
-    // handle en passant capture
-    if ((p == WP || p == BP) && m.to == enPassant) {
-        int dir = whiteToMove ? 1 : -1;
-        int capSq = m.to - dir*8;
-        dest = squares[capSq];
-        squares[capSq] = EMPTY;
+std::vector<Move> Board::generateLegalMoves() {
+    std::vector<Move> legal;
+    bool side = whiteToMove;
+    for (const Move& m : generateMoves()) {
+        makeMove(m);
+        if (!inCheck(side)) legal.push_back(m);
+        unmakeMove(m);
     }
-
-    // move piece
-    squares[m.to] = p;
-    squares[m.from] = EMPTY;
-    // promotion
-    if (m.promotion) {
-        squares[m.to] = whiteToMove ? Board::pieceFromChar(toupper(m.promotion)) : Board::pieceFromChar(tolower(m.promotion));
-    }
-    // castling rook move
-    if (p == WK && m.from == 4) {
-        if (m.to == 6) { // white king-side
-            squares[5] = WR;
-            squares[7] = EMPTY;
-        } else if (m.to == 2) { // queen-side
-            squares[3] = WR;
-            squares[0] = EMPTY;
-        }
-        castlingRights &= ~0b0011; // clear white rights
-    }
-    if (p == BK && m.from == 60) {
-        if (m.to == 62) {
-            squares[61] = BR;
-            squares[63] = EMPTY;
-        } else if (m.to == 58) {
-            squares[59] = BR;
-            squares[56] = EMPTY;
-        }
-        castlingRights &= ~0b1100; // clear black rights
-    }
-    // rook moves/captures affecting castling rights
-    if (p == WR) {
-        if (m.from == 0) castlingRights &= ~0b0010; // white Q
-        if (m.from == 7) castlingRights &= ~0b0001; // white K
-    }
-    if (p == BR) {
-        if (m.from == 56) castlingRights &= ~0b1000; // black q
-        if (m.from == 63) castlingRights &= ~0b0100; // black k
-    }
-    if (dest == WR) {
-        if (m.to == 0) castlingRights &= ~0b0010;
-        if (m.to == 7) castlingRights &= ~0b0001;
-    }
-    if (dest == BR) {
-        if (m.to == 56) castlingRights &= ~0b1000;
-        if (m.to == 63) castlingRights &= ~0b0100;
-    }
-
-    // set en passant target
-    enPassant = -1;
-    if (p == WP || p == BP) {
-        int rankFrom = m.from / 8;
-        int rankTo = m.to / 8;
-        if (abs(rankTo - rankFrom) == 2) {
-            int ep = (m.from + m.to) / 2;
-            enPassant = ep;
-        }
-    }
-
-    whiteToMove = !whiteToMove;
-    history.push_back(fen());
-    return true;
+    return legal;
 }
 
-void Board::unmakeMove(const Move& m, Piece captured, bool prevWhite, unsigned char prevCastling, int prevEP) {
-    // restore whiteToMove and state
-    whiteToMove = prevWhite;
-    castlingRights = prevCastling;
-    enPassant = prevEP;
+bool Board::isSquareAttacked(int sq, bool byWhite) const {
+    int file = sq % 8, rank = sq / 8;
 
-    Piece p = squares[m.to];
-    // undo castling rook
-    if (p == WK && m.from == 4) {
-        if (m.to == 6) {
-            squares[7] = WR;
-            squares[5] = EMPTY;
-        } else if (m.to == 2) {
-            squares[0] = WR;
-            squares[3] = EMPTY;
+    // a white pawn attacks diagonally upward, so it sits one rank below
+    Piece pawn = byWhite ? WP : BP;
+    int pr = byWhite ? rank - 1 : rank + 1;
+    for (int df : {-1, 1}) {
+        if (onBoard(file + df, pr) && squares[pr*8 + file + df] == pawn) return true;
+    }
+
+    Piece knight = byWhite ? WN : BN;
+    for (auto& d : knightDeltas) {
+        int f = file + d[0], r = rank + d[1];
+        if (onBoard(f, r) && squares[r*8 + f] == knight) return true;
+    }
+
+    Piece king = byWhite ? WK : BK;
+    for (auto& d : kingDeltas) {
+        int f = file + d[0], r = rank + d[1];
+        if (onBoard(f, r) && squares[r*8 + f] == king) return true;
+    }
+
+    Piece rook = byWhite ? WR : BR;
+    Piece bishop = byWhite ? WB : BB;
+    Piece queen = byWhite ? WQ : BQ;
+    for (int i = 0; i < 8; ++i) {
+        Piece slider = i < 4 ? rook : bishop;
+        int f = file, r = rank;
+        while (true) {
+            f += kingDeltas[i][0];
+            r += kingDeltas[i][1];
+            if (!onBoard(f, r)) break;
+            Piece q = squares[r*8 + f];
+            if (q == EMPTY) continue;
+            if (q == slider || q == queen) return true;
+            break;
         }
     }
-    if (p == BK && m.from == 60) {
-        if (m.to == 62) {
-            squares[63] = BR;
-            squares[61] = EMPTY;
-        } else if (m.to == 58) {
-            squares[56] = BR;
-            squares[59] = EMPTY;
+    return false;
+}
+
+bool Board::inCheck(bool white) const {
+    Piece king = white ? WK : BK;
+    for (int sq = 0; sq < 64; ++sq) {
+        if (squares[sq] == king) return isSquareAttacked(sq, !white);
+    }
+    return false;
+}
+
+bool Board::isCapture(const Move& m) const {
+    if (squares[m.to] != EMPTY) return true;
+    Piece p = squares[m.from];
+    return (p == WP || p == BP) && m.to == enPassant;
+}
+
+void Board::makeMove(const Move& m) {
+    Piece p = squares[m.from];
+    bool isPawn = (p == WP || p == BP);
+    Undo u{p, squares[m.to], m.to, castlingRights, enPassant, halfmoveClock};
+
+    // en passant: the captured pawn is behind the target square
+    if (isPawn && m.to == enPassant) {
+        u.capturedSq = m.to + (whiteToMove ? -8 : 8);
+        u.captured = squares[u.capturedSq];
+        squares[u.capturedSq] = EMPTY;
+    }
+    undoStack.push_back(u);
+
+    squares[m.to] = p;
+    squares[m.from] = EMPTY;
+    if (m.promotion) {
+        char c = whiteToMove ? toupper(m.promotion) : tolower(m.promotion);
+        squares[m.to] = pieceFromChar(c);
+    }
+    // castling: king moves two files, bring the rook across
+    if ((p == WK || p == BK) && std::abs(m.to - m.from) == 2) {
+        if (m.to > m.from) {
+            squares[m.from + 1] = squares[m.from + 3];
+            squares[m.from + 3] = EMPTY;
+        } else {
+            squares[m.from - 1] = squares[m.from - 4];
+            squares[m.from - 4] = EMPTY;
         }
     }
-    // restore pieces
-    squares[m.from] = p;
-    squares[m.to] = captured;
-    // en passant capture restore
-    if ((p == WP || p == BP) && m.to == prevEP && captured == EMPTY) {
-        int dir = prevWhite ? -1 : 1; // previous side
-        int capSq = m.to - dir*8;
-        squares[capSq] = (prevWhite ? BP : WP);
+    castlingRights &= castleMaskFor(m.from) & castleMaskFor(m.to);
+
+    enPassant = -1;
+    if (isPawn && std::abs(m.to - m.from) == 16) enPassant = (m.from + m.to) / 2;
+
+    halfmoveClock = (isPawn || u.captured != EMPTY) ? 0 : halfmoveClock + 1;
+    if (!whiteToMove) fullmoveNumber++;
+    whiteToMove = !whiteToMove;
+    history.push_back(hash());
+}
+
+void Board::unmakeMove(const Move& m) {
+    Undo u = undoStack.back();
+    undoStack.pop_back();
+    history.pop_back();
+
+    whiteToMove = !whiteToMove;
+    if (!whiteToMove) fullmoveNumber--;
+    castlingRights = u.castlingRights;
+    enPassant = u.enPassant;
+    halfmoveClock = u.halfmoveClock;
+
+    // restoring u.moved (not what's on m.to) also undoes promotions
+    squares[m.from] = u.moved;
+    squares[m.to] = EMPTY;
+    squares[u.capturedSq] = u.captured;
+
+    if ((u.moved == WK || u.moved == BK) && std::abs(m.to - m.from) == 2) {
+        if (m.to > m.from) {
+            squares[m.from + 3] = squares[m.from + 1];
+            squares[m.from + 1] = EMPTY;
+        } else {
+            squares[m.from - 4] = squares[m.from - 1];
+            squares[m.from - 1] = EMPTY;
+        }
     }
-    // remove last history entry
-    if (!history.empty()) history.pop_back();
 }
 
 int Board::evaluate() const {
     int score = 0;
     for (int i = 0; i < 64; ++i) {
         Piece p = squares[i];
+        int w = i ^ 56; // flip rank so white reads the tables from its side
         switch (p) {
-            case WP: score += 100 + pawnTable[i]; break;
-            case WN: score += 320 + knightTable[i]; break;
-            case WB: score += 330 + bishopTable[i]; break;
-            case WR: score += 500 + rookTable[i]; break;
-            case WQ: score += 900 + queenTable[i]; break;
-            case WK: score += 20000 + kingTable[i]; break;
-            case BP: score -= 100 + pawnTable[63 - i]; break;
-            case BN: score -= 320 + knightTable[63 - i]; break;
-            case BB: score -= 330 + bishopTable[63 - i]; break;
-            case BR: score -= 500 + rookTable[63 - i]; break;
-            case BQ: score -= 900 + queenTable[63 - i]; break;
-            case BK: score -= 20000 + kingTable[63 - i]; break;
+            case WP: score += 100 + pawnTable[w]; break;
+            case WN: score += 320 + knightTable[w]; break;
+            case WB: score += 330 + bishopTable[w]; break;
+            case WR: score += 500 + rookTable[w]; break;
+            case WQ: score += 900 + queenTable[w]; break;
+            case WK: score += kingTable[w]; break;
+            case BP: score -= 100 + pawnTable[i]; break;
+            case BN: score -= 320 + knightTable[i]; break;
+            case BB: score -= 330 + bishopTable[i]; break;
+            case BR: score -= 500 + rookTable[i]; break;
+            case BQ: score -= 900 + queenTable[i]; break;
+            case BK: score -= kingTable[i]; break;
             default: break;
         }
     }
@@ -497,15 +534,142 @@ std::string Board::fen() const {
     } else {
         s += '-';
     }
+    s += ' ' + std::to_string(halfmoveClock) + ' ' + std::to_string(fullmoveNumber);
     return s;
 }
 
-bool Board::isThreefold() const {
-    if (history.empty()) return false;
-    std::string cur = history.back();
-    int count = 0;
-    for (auto &h : history) {
-        if (h == cur) count++;
+uint64_t Board::hash() const {
+    uint64_t h = 0;
+    for (int sq = 0; sq < 64; ++sq) {
+        if (squares[sq] != EMPTY) h ^= zobrist.piece[squares[sq]][sq];
     }
-    return count >= 3;
+    if (!whiteToMove) h ^= zobrist.blackToMove;
+    h ^= zobrist.castling[castlingRights];
+    if (enPassant >= 0) h ^= zobrist.epFile[enPassant % 8];
+    return h;
+}
+
+// how many times the current position has occurred; only positions since the
+// last capture or pawn move can repeat, and only with the same side to move
+int Board::repetitionCount() const {
+    int count = 0;
+    int n = (int)history.size();
+    uint64_t cur = history.back();
+    for (int i = n - 1; i >= 0 && i >= n - 1 - halfmoveClock; i -= 2) {
+        if (history[i] == cur) count++;
+    }
+    return count;
+}
+
+bool Board::isThreefold() const {
+    return repetitionCount() >= 3;
+}
+
+bool Board::isFiftyMove() const {
+    return halfmoveClock >= 100;
+}
+
+uint64_t Board::perft(int depth) {
+    if (depth == 0) return 1;
+    auto moves = generateLegalMoves();
+    if (depth == 1) return moves.size();
+    uint64_t total = 0;
+    for (const Move& m : moves) {
+        makeMove(m);
+        total += perft(depth - 1);
+        unmakeMove(m);
+    }
+    return total;
+}
+
+std::string Board::toSan(const Move& m) {
+    Piece p = squares[m.from];
+    auto squareName = [](int sq) {
+        return std::string{char('a' + sq % 8), char('1' + sq / 8)};
+    };
+
+    std::string san;
+    if ((p == WK || p == BK) && std::abs(m.to - m.from) == 2) {
+        san = m.to > m.from ? "O-O" : "O-O-O";
+    } else if (p == WP || p == BP) {
+        if (isCapture(m)) {
+            san += char('a' + m.from % 8);
+            san += 'x';
+        }
+        san += squareName(m.to);
+        if (m.promotion) {
+            san += '=';
+            san += char(toupper(m.promotion));
+        }
+    } else {
+        san += char(toupper(pieceToChar(p)));
+        // if another piece of the same kind can reach the same square, add
+        // the file, else the rank, else both, of the piece that moves
+        bool clash = false, sameFile = false, sameRank = false;
+        for (const Move& o : generateLegalMoves()) {
+            if (o.to != m.to || o.from == m.from || squares[o.from] != p) continue;
+            clash = true;
+            if (o.from % 8 == m.from % 8) sameFile = true;
+            if (o.from / 8 == m.from / 8) sameRank = true;
+        }
+        if (clash) {
+            if (!sameFile) san += char('a' + m.from % 8);
+            else if (!sameRank) san += char('1' + m.from / 8);
+            else san += squareName(m.from);
+        }
+        if (isCapture(m)) san += 'x';
+        san += squareName(m.to);
+    }
+
+    makeMove(m);
+    if (inCheck(whiteToMove)) san += generateLegalMoves().empty() ? '#' : '+';
+    unmakeMove(m);
+    return san;
+}
+
+// drop the decorations people type inconsistently: x, +, #, =, !, ?
+static std::string normalizeSan(const std::string& s) {
+    std::string out;
+    for (char c : s) {
+        if (c == 'x' || c == 'X' || c == '+' || c == '#' || c == '=' || c == '!' || c == '?') continue;
+        out += (c == '0') ? 'O' : c;
+    }
+    return out;
+}
+
+static std::string lowerCase(std::string s) {
+    for (char& c : s) c = tolower(c);
+    return s;
+}
+
+bool Board::parseMove(const std::string& text, Move& out) {
+    auto legal = generateLegalMoves();
+    std::string want = normalizeSan(text);
+    std::string wantLower = lowerCase(want);
+
+    // exact-case SAN wins: "bxc3" is a pawn capture, "Bxc3" a bishop move
+    const Move* loose = nullptr;
+    int looseCount = 0;
+    for (const Move& m : legal) {
+        std::string san = normalizeSan(toSan(m));
+        if (san == want) { out = m; return true; }
+        // "e8" for a promotion means queen
+        if (m.promotion == 'q' && san == want + "Q") { out = m; return true; }
+        if (lowerCase(san) == wantLower || (m.promotion == 'q' && lowerCase(san) == wantLower + "q")) {
+            loose = &m;
+            looseCount++;
+        }
+    }
+    if (looseCount == 1) { out = *loose; return true; }
+
+    // coordinates: e2e4, e7e8q
+    std::string lower = lowerCase(text);
+    for (const Move& m : legal) {
+        std::string coord = m.toString();
+        if (coord == lower || (m.promotion == 'q' && coord == lower + "q")) {
+            out = m;
+            return true;
+        }
+    }
+    return false;
 }

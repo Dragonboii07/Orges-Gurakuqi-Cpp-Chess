@@ -9,4 +9,5 @@ struct Move {
 
     Move(int f, int t, char p = 0) : from(f), to(t), promotion(p) {}
     std::string toString() const;
+    bool operator==(const Move& o) const { return from == o.from && to == o.to && promotion == o.promotion; }
 };
