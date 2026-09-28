@@ -91,6 +91,15 @@ g++ -std=c++17 -O2 src/Board.cpp src/Engine.cpp src/Move.cpp tests/engine_tests.
 ctest -C Release
 ```
 
+## Credits
+
+Designed and built by Orges Gurakuqi: the board representation, move
+generation, evaluation, search and command-line interface.
+
+I used an AI coding assistant (Claude) to review and polish the code. It
+helped me track down bugs in the chess rules, strengthen the search, add
+chess.com-style move notation and write the tests.
+
 ## License
 
 This project is licensed under the MIT License - see [LICENSE](LICENSE) for
